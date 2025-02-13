@@ -53,7 +53,7 @@ The user needs specific privileges to read VM and infrastructure data. Assign th
 ## Triggering Webhook 
 
 In order to connect this with your Alertmanager it is mandatory to create this labels. 
-You can check my automatic PVE scraper [pve-scraper](https://github.com/vvvesss/pve-scraper)
+You can check my automatic PVE scraper [pve-scraper](https://github.com/vvvesss/pve-scraper).
 We can simulate Alertmanager webhook desired fields with this simple curl command:
 
 ```
