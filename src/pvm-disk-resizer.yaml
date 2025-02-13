@@ -1,0 +1,364 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: pvm-disk-resizer
+  namespace: pvm-disk-resizer
+  annotations:
+spec:
+  ports:
+    - name: pvm-disk-resizer
+      port: 8000
+      protocol: TCP
+      targetPort: pvm-disk-resizer
+  selector:
+    app: pvm-disk-resizer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pvm-disk-resizer
+  namespace: pvm-disk-resizer
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pvm-disk-resizer
+  template:
+    metadata:
+      labels:
+        app: pvm-disk-resizer
+      annotations:
+        vault.hashicorp.com/agent-inject: 'true'
+        vault.hashicorp.com/role: 'pvm-disk-resizer'
+        vault.hashicorp.com/agent-inject-secret-config: "secret/pvm-disk-resizer/credentials"
+        vault.hashicorp.com/agent-inject-template-config: |
+          {{- with secret "secret/pvm-disk-resizer/credentials" -}}
+            USER="{{ .Data.data.username }}"
+            PASS="{{ .Data.data.password }}"
+            SLACK="{{ .Data.data.slack }}"
+          {{- end }}
+        vault.hashicorp.com/agent-inject-secret-ssh: "ssh-key/pve-vm-private-key"
+        vault.hashicorp.com/agent-inject-template-ssh: |
+          {{- with secret "ssh-key/pve-vm-private-key" -}}
+            {{ .Data.key }}
+          {{- end }}
+    spec:
+      serviceAccountName: pvm-disk-resizer-sa
+      containers:
+      - name: pvm-disk-resizer
+        image: ruby:alpine
+        command: ["/bin/sh", "-c"]
+        args: 
+          - >
+            apk add --no-cache curl openssh &&
+            . /vault/secrets/config &&
+            gem install webrick httparty &&
+            mkdir /root/.ssh &&
+            cp /vault/secrets/ssh /root/.ssh/id_rsa &&
+            chmod 400 /root/.ssh/id_rsa &&
+            cp /scripts/ssh-config /etc/ssh/ssh_config &&
+            ruby /scripts/pvm-resizer.rb 
+        volumeMounts:
+          - name: scripts
+            mountPath: /scripts
+        resources:
+          requests:
+            memory: 64Mi
+            cpu: 10m
+          limits:
+            memory: 128Mi
+        ports:
+        - containerPort: 8000
+          name: pvm-disk-resizer
+          protocol: TCP
+        livenessProbe:
+          tcpSocket:
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 300
+          timeoutSeconds: 15
+          failureThreshold: 3
+      volumes:
+        - name: scripts
+          configMap:
+            name: pvm-resizer-files
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pvm-disk-resizer-sa-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+- kind: ServiceAccount
+  name: pvm-disk-resizer-sa
+  namespace: pvm-disk-resizer
+---
+apiVersion: v1
+data:
+  pvm-resizer.rb: |
+    require 'webrick'
+    require 'json'
+    require 'httparty'
+
+    PROXMOX_URL = 'https://192.168.5.4:8006/api2/json'
+    ALLOWED_MOUNTPOINTS = ["/media/data", "/var/lib/mongodb"]
+
+    begin
+      config_file = '/vault/secrets/config'
+      config_content = File.read(config_file)
+      
+      # Extract USERNAME and PASSWORD
+      username_match = config_content.match(/USER="([^"]+)"/)
+      password_match = config_content.match(/PASS="([^"]+)"/)
+      slack_match = config_content.match(/SLACK="([^"]+)"/)
+      
+      USERNAME = username_match[1] if username_match
+      PASSWORD = password_match[1] if password_match
+      SLACK = slack_match[1] if slack_match
+    rescue => e
+      puts "Error reading or parsing config file /vault/secrets/config"
+      exit 1
+    end
+
+
+
+    def set_size(pve_data)
+      response = HTTParty.post("#{PROXMOX_URL}/access/ticket", {
+        headers: { 'Content-Type' => 'application/x-www-form-urlencoded' },
+        body: {
+          username: USERNAME,
+          password: PASSWORD
+        },
+        verify: false # Skip SSL verification for self-signed certificates
+      })
+
+      if response.code != 200
+        return { error: "Unable to authenticate" }.to_json
+      end
+      node = pve_data[:pvehost]
+      vmid = pve_data[:vm_id]
+      ticket = response.parsed_response['data']['ticket']
+      csrf_token = response.parsed_response['data']['CSRFPreventionToken']
+      new_size = 0 
+      #puts "#{PROXMOX_URL}/nodes/#{pve_data[:pvehost]}/qemu/#{pve_data[:vm_id]}/config"
+      url = "#{PROXMOX_URL}/nodes/#{node}/qemu/#{vmid}/config"
+      config_response = HTTParty.get(url, {
+        headers: {
+          'Cookie' => "PVEAuthCookie=#{ticket}"
+        },
+        verify: false
+      })
+      scsi_disk = config_response['data'].keys.find { |k| k.start_with?('scsi') }
+      scsi_info = config_response.dig('data', scsi_disk)
+
+      if scsi_info.nil?
+        puts "Error: No SCSI disk found in VM config"
+        return
+      end
+      #scsi_info = config_response['data']['scsi1']
+
+      if scsi_info
+        begin
+          # Parse scsi info
+          pool_vm_disk, *params = scsi_info.split(',')
+          pool, vm_disk_name = pool_vm_disk.split(':')
+          
+          size_param = params.find { |param| param.start_with?('size=') }
+          size_value = size_param.split('=')[1] if size_param
+
+          if size_value
+            # Extract the numeric size and unit
+            size_value_match = size_value.match(/(\d+)([A-Z])/)
+            if size_value_match
+              numeric_size = size_value_match[1].to_f
+              unit = size_value_match[2]
+
+              # Calculate new size with 10% increase and round to one decimal place
+              increase = ((numeric_size * 1.10) - numeric_size).to_i
+
+              puts "Original Size: #{numeric_size}#{unit}"
+              puts "Increased Size: #{increase}#{unit}"
+            else
+              puts "Size value format is incorrect"
+            end
+          else
+            puts "Size information is not available"
+          end
+        rescue StandardError => e
+          puts "An error occurred: #{e.message}"
+          puts "scsi_info: #{scsi_info}"
+        end
+      else
+        puts "scsi information is not available"
+      end
+      color = ""
+      status = ""
+      if increase > 0
+        # Construct the URL
+        full_increase = "+#{increase}#{unit}"
+        url = "#{PROXMOX_URL}/nodes/#{node}/qemu/#{vmid}/resize"
+        puts "resieze called for #{url} payload disk: #{scsi_disk}, size: #{full_increase}"
+        # Make the POST request with HTTParty
+        data = {
+          'disk' => scsi_disk,
+          'size' => full_increase
+        }
+        response = HTTParty.put(url, {
+          body: data.to_json,
+          headers: {
+            "Cookie" => "PVEAuthCookie=#{ticket}",
+            "Content-Type" => 'application/json',
+            "CSRFPreventionToken" => csrf_token
+          },
+          verify: false  # Disable SSL verification, set to true in production
+        })
+        puts "response => '#{response.code}'"
+        if response.code == 200
+          sleep 60
+          fs_type = `ssh ubuntu@#{pve_data[:ip]} 'df -T #{pve_data[:mountpoint]} | tail -1 | awk "{print \\$2}"'`.strip
+          if fs_type == "xfs"
+            fs_resize_output = `ssh ubuntu@#{pve_data[:ip]} 'sudo xfs_growfs -d #{pve_data[:mountpoint]}'`
+          elsif fs_type == "ext4"
+            fs_resize_output = `ssh ubuntu@#{pve_data[:ip]} 'sudo resize2fs #{pve_data[:device]}'`
+          else
+            puts "Unsupported filesystem: #{fs_type}"
+            return
+          end
+          #puts "Execute: ssh ubuntu@#{pve_data[:ip]} 'sudo xfs_growfs -d #{pve_data[:mountpoint]}'"
+          #fs_resize_output = `ssh ubuntu@#{pve_data[:ip]} 'sudo xfs_growfs -d #{pve_data[:mountpoint]}'`
+          #puts "fs_resize_output => #{fs_resize_output}"
+          fs_size_output = `ssh ubuntu@#{pve_data[:ip]} 'df -hT | grep #{pve_data[:mountpoint]}'`
+          columns = fs_size_output.split
+          fs_size_output = "#{columns[6]} #{columns[2]}"
+          new_size = "#{columns[2]}"
+          old_size = "#{numeric_size.to_i}#{unit}"
+          puts "New Size => #{fs_size_output}"
+          if "#{old_size}" == "#{new_size}" || new_size == ""
+            puts "Failed nothing happened #{old_size} != #{new_size}" 
+            color = "danger"
+            status = "FAILED"
+            text = "Resize failed #{old_size} == #{new_size}\n"
+          else
+            color = "good"
+            status = "SUCCESS"
+            text = "Disk size before resize in GiB: #{old_size}\n"
+            text += "Disk size after resize in GiB: #{new_size}\n"
+            text += "Filesystem info after resize: #{fs_size_output}\n"
+            text += "IP address: #{pve_data[:ip]}\n"
+            text += "Device Name: #{pve_data[:device]}\n"
+          end
+        else
+          color = "danger"
+          status = "FAILED"
+          text = "Proxmox API bad response: #{response.code} - #{response.body}\n"
+          text += "URL: #{PROXMOX_URL}\n"
+        end
+      else
+        color = "danger"
+        status = "FAILED"
+        text = "Wrong increase step #{increase} <= 0\n"
+      end
+      puts "Finished: status #{status}"
+      slack_hook(new_size,pve_data[:instance],color,status,text)
+    end
+
+
+    def slack_hook(new_size,host,color,status,text)
+          curl_output = `curl -s -S -X POST -H 'Content-type: application/json' --data "{
+              'channel': '#your-slack-channel',
+              'username': 'PVM Disk Resizer',
+              'attachments': [
+                  {
+                      'fallback': 'PVE VM Disk resize status',
+                      'color': '#{color}',
+                      'pretext': '### PVE VM Disk resize status *#{status}* - HOST: *#{host}* ###',
+                      'text': '#{text}'
+                  }
+              ]
+          }" https://hooks.slack.com/services/#{SLACK}`
+    end
+
+
+    # Create a basic HTTP server
+    server = WEBrick::HTTPServer.new(Port: 8000)
+
+    # Define a catch-all handler for all paths
+    server.mount_proc '/' do |req, res|
+      if req.request_method == 'POST'
+        begin
+          # Parse the JSON request body
+          data = JSON.parse(req.body)
+
+          # Extract the required values from the commonLabels
+          common_labels = data['commonLabels']
+          pve_data = {
+            mountpoint: common_labels['mountpoint'],
+            device: common_labels['device'],
+            ip: common_labels['ip'],
+            pvehost: common_labels['pvehost'],
+            instance: common_labels['instance'],
+            project: common_labels['project'],
+            vm_id: common_labels['vm_id']
+          }
+
+          pve_data_check = true
+          pve_data.each do |key, value|
+            if value.nil? || value.to_s.strip.empty?
+              pve_data_check = false
+              puts "Warning: '#{key}' is missing or undefined"
+            end
+          end
+
+          # Print the extracted data to the console
+          puts "Extracted data: #{pve_data}"
+
+          # Respond with a success message
+          response_body = { message: 'Webhook received successfully' }.to_json
+          res.status = 200
+          res['Content-Type'] = 'application/json'
+          res.body = response_body
+          if ALLOWED_MOUNTPOINTS.include?(pve_data[:mountpoint]) && pve_data_check
+            set_size(pve_data) 
+          else
+            color = "danger"
+            status = "FAILED"
+            text = "Host #{pve_data[:instance]} failed to resize. Wrong mount point #{pve_data[:mountpoint]}"
+            puts text
+            slack_hook(0,pve_data[:instance],color,status,text)
+          end
+        rescue JSON::ParserError => e
+          res.status = 400
+          res['Content-Type'] = 'application/json'
+          res.body = { error: 'Invalid JSON' }.to_json
+        end
+      else
+        res.status = 405
+        res['Content-Type'] = 'application/json'
+        res.body = { error: 'Method not allowed' }.to_json
+      end
+    end
+
+    # Trap signal to gracefully shutdown the server
+    trap 'INT' do
+      server.shutdown
+    end
+
+    # Start the server
+    server.start
+  ssh-config: |
+    Include /etc/ssh/ssh_config.d/*.conf
+    Host *
+        StrictHostKeyChecking no
+        SendEnv LANG LC_*
+        HashKnownHosts yes
+kind: ConfigMap
+metadata:
+  creationTimestamp: null
+  name: pvm-resizer-files
+  namespace: pvm-disk-resizer
+
